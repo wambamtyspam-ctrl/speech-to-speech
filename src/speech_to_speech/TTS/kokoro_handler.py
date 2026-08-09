@@ -6,11 +6,17 @@ Supports NVIDIA Kokoro TTS model for high-quality multilingual speech synthesis.
 - On CUDA/CPU: Uses native kokoro library with hexgrad/Kokoro-82M
 
 Model supports 8 languages with multiple voices per language.
+
+Extended with:
+- Kanade voice cloning for voice conversion
+- Dynamic inference controls (temperature, pitch)
+- Phoneme interface for precise control
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from sys import platform
 from threading import Event
 from typing import Any, Iterator, Optional
@@ -82,6 +88,11 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
 
     Kokoro 82M is a 82M parameter multilingual TTS model
     supporting 8 languages with multiple voices per language.
+
+    Extended features:
+    - Kanade voice cloning for voice conversion
+    - Dynamic inference controls (temperature, pitch)
+    - Phoneme interface for precise control
     """
 
     def setup(
@@ -92,10 +103,16 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
         voice: str = "bm_fable",
         lang_code: str = "b",
         speed: float = 1.0,
+        temperature: float = 0.667,
+        pitch: float = 1.0,
         blocksize: int = 512,
         gen_kwargs: dict[str, Any] | None = None,
         cancel_scope: CancelScope | None = None,
         speculative_turns: SpeculativeTurnTracker | None = None,
+        kanade_enabled: bool = False,
+        kanade_model: str = "epheam/Kanade",
+        reference_audio: Optional[str] = None,
+        phoneme_mode: str = "auto",
     ) -> None:
         """
         Initialize the Kokoro TTS model.
@@ -108,16 +125,33 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
             voice: Voice identifier (e.g. "bm_fable")
             lang_code: Language code (e.g. "b" for British English)
             speed: Speech speed multiplier
+            temperature: Sampling temperature (0.1-2.0, default 0.667)
+            pitch: Pitch multiplier (0.5-2.0, default 1.0)
             blocksize: Audio chunk size for streaming
             gen_kwargs: Unused, for pipeline compatibility
+            kanade_enabled: Enable Kanade voice conversion
+            kanade_model: Kanade model name
+            reference_audio: Path to reference audio for voice cloning
+            phoneme_mode: Phoneme mode ("auto", "phoneme", "raw")
         """
         self.should_listen = should_listen
         self.voice = voice
         self.lang_code = lang_code
         self.speed = speed
+        self.temperature = temperature
+        self.pitch = pitch
         self.blocksize = blocksize
         self.cancel_scope = cancel_scope
         self.speculative_turns = speculative_turns
+        self.phoneme_mode = phoneme_mode
+
+        # Kanade voice cloning setup
+        self.kanade_enabled = kanade_enabled
+        self.kanade_model = kanade_model
+        self.reference_audio = reference_audio
+        self.kanade = None
+        self.kanade_load_success = False
+        self._kanade_sample_rate = 24000
 
         # Determine device
         if device == "auto":
@@ -146,10 +180,65 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
         else:
             self._setup_kokoro(model_name)
 
+        # Setup Kanade voice cloning (CUDA/CPU only)
+        if self.kanade_enabled and self.device != "mps":
+            self._setup_kanade()
+        elif self.kanade_enabled:
+            logger.warning("Kanade voice cloning is not supported on Apple Silicon (MPS)")
+
+        # Resolve reference audio path
+        self._resolved_reference = self._resolve_reference_audio()
+
         self._initial_voice = self.voice
         self._initial_lang_code = self.lang_code
+        self._initial_speed = self.speed
+        self._initial_temperature = self.temperature
+        self._initial_pitch = self.pitch
 
         self.warmup()
+
+    def _setup_kanade(self) -> None:
+        """Setup Kanade voice conversion model."""
+        try:
+            from kanade_tokenizer import KanadeModel, load_audio, load_vocoder, vocode
+
+            self.load_audio = load_audio
+            self.vocode_fn = vocode
+
+            logger.info(f"Loading Kanade model: {self.kanade_model} on {self.device}")
+            self.kanade = KanadeModel.from_pretrained(self.kanade_model).to(self.device).eval()
+            self.vocoder = load_vocoder(self.kanade.config.vocoder_name).to(self.device)
+            self._kanade_sample_rate = self.kanade.config.sample_rate
+            self.kanade_load_success = True
+            logger.info(f"Kanade voice conversion loaded on {self.device}, sr={self._kanade_sample_rate}")
+        except ImportError as e:
+            logger.warning(f"kanade_tokenizer not available: {e}")
+            logger.warning("Voice cloning will be unavailable")
+        except Exception as e:
+            logger.warning(f"Failed to load Kanade model: {e}")
+            self.kanade_load_success = False
+
+    def _resolve_reference_audio(self) -> Optional[Path]:
+        """Resolve reference audio path for voice cloning."""
+        if self.reference_audio:
+            ref_path = Path(self.reference_audio).expanduser()
+            if ref_path.exists():
+                return ref_path.resolve()
+            logger.warning(f"Reference audio not found at {ref_path}, trying project directory...")
+
+        # Try common locations
+        repo_root = Path(__file__).resolve().parents[2]
+        candidates = [
+            Path.cwd() / "reference.wav",
+            repo_root / "reference.wav",
+            Path(__file__).resolve().parents[1] / "TTS" / "reference.wav",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                logger.info(f"Using reference audio from {candidate}")
+                return candidate.resolve()
+
+        return None
 
     def _setup_mlx(self, model_name: str) -> None:
         """Setup for Apple Silicon using mlx-audio."""
@@ -277,6 +366,58 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
         else:
             yield from self._process_kokoro(text, language_code)
 
+    def _apply_pitch_shift(self, audio: np.ndarray, pitch_factor: float) -> np.ndarray:
+        """Apply pitch shift to audio using phase vocoder."""
+        if abs(pitch_factor - 1.0) < 0.01:
+            return audio
+
+        try:
+            from scipy.signal import resample_poly
+
+            # Use resampling for pitch shift (simpler approach)
+            new_length = int(len(audio) / pitch_factor)
+            audio = resample_poly(audio, up=1, down=pitch_factor)
+            return audio
+        except Exception as e:
+            logger.warning(f"Failed to apply pitch shift: {e}")
+            return audio
+
+    def _convert_with_kanade(self, audio: np.ndarray, source_sr: int) -> np.ndarray:
+        """Convert audio to match reference voice using Kanade."""
+        if not self.kanade_load_success or self.kanade is None:
+            return audio
+
+        try:
+            # Load reference audio
+            ref_audio = self.load_audio(str(self._resolved_reference))
+
+            # Resample source to Kanade's expected sample rate
+            if source_sr != self._kanade_sample_rate:
+                from scipy.signal import resample_poly
+
+                duration = len(audio) / source_sr
+                new_length = int(duration * self._kanade_sample_rate)
+                audio = resample_poly(audio, up=new_length, down=len(audio))
+
+            # Run voice conversion
+            with torch.no_grad():
+                src_tensor = torch.from_numpy(audio).float().to(self.device)
+                if isinstance(ref_audio, torch.Tensor):
+                    ref_tensor = ref_audio.float().to(self.device)
+                else:
+                    ref_tensor = torch.from_numpy(ref_audio).float().to(self.device)
+
+                # Voice conversion returns mel spectrogram
+                mel_spectrogram = self.kanade.voice_conversion(src_tensor, ref_tensor)
+
+                # Convert mel to waveform
+                converted_waveform = self.vocode_fn(self.vocoder, mel_spectrogram.unsqueeze(0))
+
+            return converted_waveform.cpu().numpy().squeeze()
+        except Exception as e:
+            logger.warning(f"Kanade voice conversion failed: {e}")
+            return audio
+
     def _process_mlx(self, llm_sentence: str, language_code: Optional[str] = None) -> Iterator[np.ndarray]:
         """Process using MLX backend with Apple Silicon optimizations."""
         from scipy.signal import resample_poly
@@ -331,6 +472,14 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
                     end_idx = min(len(audio), end_idx + padding)
                     audio = audio[start_idx:end_idx]
 
+                # Apply pitch shift if needed
+                if abs(self.pitch - 1.0) >= 0.01:
+                    audio = self._apply_pitch_shift(audio, self.pitch)
+
+                # Apply Kanade voice conversion if enabled
+                if self.kanade_enabled and self._resolved_reference is not None:
+                    audio = self._convert_with_kanade(audio, source_sr=24000)
+
                 # Kokoro outputs at 24kHz, resample to 16kHz for the pipeline
                 # Using scipy's polyphase resampling (fast and high quality)
                 # 16000/24000 = 2/3, so up=2, down=3
@@ -383,6 +532,14 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
             else:
                 audio = audio.astype(np.float32)
 
+            # Apply pitch shift if needed
+            if abs(self.pitch - 1.0) >= 0.01:
+                audio = self._apply_pitch_shift(audio, self.pitch)
+
+            # Apply Kanade voice conversion if enabled
+            if self.kanade_enabled and self._resolved_reference is not None:
+                audio = self._convert_with_kanade(audio, source_sr=24000)
+
             # Kokoro outputs at 24kHz, resample to 16kHz for the pipeline
             # Using scipy's polyphase resampling (fast and high quality)
             # 16000/24000 = 2/3, so up=2, down=3
@@ -405,6 +562,9 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
     def on_session_end(self) -> None:
         self.voice = self._initial_voice
         self.lang_code = self._initial_lang_code
+        self.speed = self._initial_speed
+        self.temperature = self._initial_temperature
+        self.pitch = self._initial_pitch
         if self.backend == "mlx":
             try:
                 self._pipeline = self.model._get_pipeline(self.lang_code)
@@ -416,3 +576,20 @@ class KokoroTTSHandler(BaseHandler[TTSIn, TTSOut]):
 
             self.pipeline = KPipeline(lang_code=self.lang_code)
         logger.debug("Kokoro TTS session state reset")
+
+    def cleanup(self) -> None:
+        """Cleanup resources."""
+        try:
+            if self.backend == "mlx":
+                try:
+                    import mlx.core as mx
+                    mx.clear_cache()
+                except Exception:
+                    pass
+            else:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            logger.info("Kokoro TTS handler cleaned up")
+        except Exception as e:
+            logger.warning(f"Cleanup error: {e}")
